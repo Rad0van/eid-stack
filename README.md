@@ -45,9 +45,10 @@ x86 is emulated by **FEX** → FEX needs an **x86 RootFS** for base system libra
 | **socat** | IPv6 `localhost` shim | stock | `apt: socat` |
 | Python 3, cargo, sudo, dpkg-deb | tooling | — | distro |
 
-Only **muvm must be the custom fork** — its patches (pcscd vsock bridge, the port
-15480 loopback proxy, EPERM-tolerant stdin, `vm.overcommit_memory=1`) are what make
-the eID stack work. Everything else is stock plumbing. `muvm-service` keeps the
+Only **muvm must be the custom fork** — its patches (pcscd vsock bridge, the
+guest-side loopback proxy, a host-side **IPv6 `localhost` proxy**, EPERM-tolerant
+stdin, `vm.overcommit_memory=1`) are what make the eID stack work. Everything else
+is stock plumbing. `muvm-service` keeps the
 `~/.local/bin/muvm-guest → ~/.cargo/bin/muvm-guest` PATH symlink so the host muvm
 finds the patched guest binary.
 
@@ -117,9 +118,11 @@ eid-stack update websigner        # fetch+extract the latest .deb, then re-point
 These are non-obvious workarounds for the muvm/FEX environment that `eid-stack` applies:
 
 - **IPv6 `localhost`** — Brave/Chromium resolve `localhost` to `::1` first, but
-  passt forwards IPv4 only. `muvm-service` binds passt to `127.0.0.1` and installs
-  `eid-ipv6-shim.service` (`socat ::1:15480 → 127.0.0.1:15480`); otherwise portals
-  report *"eID klient is not running"*.
+  passt binds published ports dual-stack and accepts `::1` without forwarding it,
+  so portals report *"eID klient is not running"*. **Handled in the muvm fork:** it
+  binds passt IPv4-only and runs its own `::1 → 127.0.0.1` proxy per published port.
+  (Earlier eid-stack versions did this with a separate `eid-ipv6-shim.service` +
+  `-p=127.0.0.1:…`; `muvm-service` now removes that legacy unit on install.)
 - **JRE executable bits** — `zipfile.extractall()` drops the modes stored in the
   Zulu JRE zip, leaving `bin/java` non-executable → D.Signer fails with
   `execve: Permission denied`. `dsigner` extracts with a mode-preserving helper.

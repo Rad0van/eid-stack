@@ -321,31 +321,13 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# passt bound IPv4-only (127.0.0.1) so eid-ipv6-shim.service can own ::1:15480.
-# Brave/Chromium resolve localhost->::1 first; a dual-stack passt accepts the
-# IPv6 connection but never forwards it, so the portal reports "eID not running".
-ExecStart=%h/.cargo/bin/muvm --mem=4096 -p=127.0.0.1:15480:15480 -- /bin/sleep infinity
+# muvm publishes 15480 for eID Klient's tcToken bridge. The patched muvm binds
+# passt IPv4-only and starts its own ::1->127.0.0.1 proxy, so Brave/Chromium's
+# localhost (which resolves to ::1 first) reaches eID Klient with no separate
+# shim service. (Older versions used -p=127.0.0.1:... + eid-ipv6-shim.service.)
+ExecStart=%h/.cargo/bin/muvm --mem=4096 -p=15480:15480 -- /bin/sleep infinity
 Restart=on-failure
 RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-"""
-
-# IPv6 loopback shim: forwards ::1:15480 -> 127.0.0.1:15480 (passt) so that
-# Brave/Chromium, which hit localhost->::1 first, reach eID Klient. %SOCAT% is
-# substituted with the resolved socat path at install time.
-SHIM_UNIT_BODY = """\
-[Unit]
-Description=eID Klient IPv6 loopback shim (::1:15480 -> 127.0.0.1:15480)
-After=dlauncher2-muvm.service
-PartOf=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=%SOCAT% TCP6-LISTEN:15480,bind=[::1],fork,reuseaddr TCP4:127.0.0.1:15480
-Restart=on-failure
-RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target
@@ -416,40 +398,35 @@ def install_muvm_service() -> None:
              f"The system muvm-guest (if any) will be used instead, "
              f"which may not have pcscd/loopback bridging.")
 
-    # systemd units
+    # Migration: the IPv6 loopback is now handled inside muvm itself (it binds
+    # passt IPv4-only and runs its own ::1->127.0.0.1 proxy), so drop the legacy
+    # eid-ipv6-shim.service if an older install created one.
+    _remove_ipv6_shim_unit()
+
+    # systemd unit
     SYSTEMD_UNIT.parent.mkdir(parents=True, exist_ok=True)
     SYSTEMD_UNIT.write_text(SYSTEMD_UNIT_BODY)
     ok(f"wrote {SYSTEMD_UNIT}")
 
-    # IPv6 loopback shim (see SHIM_UNIT_BODY). Needs socat on the host.
-    socat = shutil.which("socat")
-    if socat:
-        SHIM_UNIT.write_text(SHIM_UNIT_BODY.replace("%SOCAT%", socat))
-        ok(f"wrote {SHIM_UNIT}")
-    else:
-        warn("socat not found; skipping eid-ipv6-shim.service. Brave/Chromium "
-             "'localhost' (IPv6 ::1) won't reach eID Klient and portals may report "
-             "'eID not running'. Install socat and re-run `eid-stack reinstall muvm-service`.")
-
     systemctl_user("daemon-reload")
     systemctl_user("enable", "dlauncher2-muvm.service")
-    # Restart muvm first so passt rebinds IPv4-only and frees ::1 for the shim.
     systemctl_user("restart", "dlauncher2-muvm.service")
     ok("muvm service started")
-    if socat:
-        systemctl_user("enable", "eid-ipv6-shim.service")
-        systemctl_user("restart", "eid-ipv6-shim.service")
-        ok("eid-ipv6-shim service started")
 
     state_set("muvm-service", source="local")
 
 
-def uninstall_muvm_service() -> None:
+def _remove_ipv6_shim_unit() -> None:
+    """Remove the legacy eid-ipv6-shim.service (muvm now does this internally)."""
     if SHIM_UNIT.exists():
         systemctl_user("stop", "eid-ipv6-shim.service", check=False)
         systemctl_user("disable", "eid-ipv6-shim.service", check=False)
         SHIM_UNIT.unlink()
-        ok(f"removed {SHIM_UNIT}")
+        ok(f"removed legacy {SHIM_UNIT}")
+
+
+def uninstall_muvm_service() -> None:
+    _remove_ipv6_shim_unit()
     if SYSTEMD_UNIT.exists():
         systemctl_user("stop", "dlauncher2-muvm.service", check=False)
         systemctl_user("disable", "dlauncher2-muvm.service", check=False)
@@ -464,18 +441,13 @@ def uninstall_muvm_service() -> None:
 
 def status_muvm_service() -> dict:
     out = {"installed": SYSTEMD_UNIT.exists(), "active": False,
-           "guest_symlink": MUVM_GUEST_SYMLINK.is_symlink(),
-           "shim_installed": SHIM_UNIT.exists(), "shim_active": False}
+           "guest_symlink": MUVM_GUEST_SYMLINK.is_symlink()}
     if out["installed"]:
         # Bypass run() so neither the "$ systemctl …" trace nor systemctl's own
         # "active" stdout leak into `list` output.
         r = subprocess.run(["systemctl", "--user", "is-active", "dlauncher2-muvm.service"],
                            capture_output=True, text=True, check=False)
         out["active"] = (r.returncode == 0)
-    if out["shim_installed"]:
-        r = subprocess.run(["systemctl", "--user", "is-active", "eid-ipv6-shim.service"],
-                           capture_output=True, text=True, check=False)
-        out["shim_active"] = (r.returncode == 0)
     return out
 
 
@@ -1284,8 +1256,6 @@ def cmd_list() -> None:
             st = status_muvm_service()
             installed = "yes" if st["installed"] else "no"
             extra = "active" if st["active"] else "inactive" if st["installed"] else "—"
-            if st["active"] and not st["shim_active"]:
-                extra += " (no ipv6 shim)"
             update = "—"
         elif comp == "dlauncher":
             st = status_dlauncher()
