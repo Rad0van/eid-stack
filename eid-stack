@@ -1504,8 +1504,15 @@ def _fix_muvm() -> None:
         src = MUVM_REPO / "target/release" / b
         if not src.exists():
             die(f"build did not produce {src}")
-        shutil.copy2(src, cargo_bin / b)
-        (cargo_bin / b).chmod(0o755)
+        # Stage in the same dir then atomically rename over the target, so a
+        # re-run while the persistent VM is using the old `muvm` doesn't fail
+        # with ETXTBSY ("Text file busy") — rename unlinks the in-use inode and
+        # the running process keeps its mapped copy.
+        dst = cargo_bin / b
+        tmp = cargo_bin / f".{b}.new"
+        shutil.copy2(src, tmp)
+        tmp.chmod(0o755)
+        os.replace(tmp, dst)
     ok(f"installed muvm + muvm-guest to {cargo_bin}")
 
 

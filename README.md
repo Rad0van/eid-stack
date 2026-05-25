@@ -117,6 +117,14 @@ These are non-obvious workarounds for the muvm/FEX environment that `eid-stack` 
 - **JRE executable bits** — `zipfile.extractall()` drops the modes stored in the
   Zulu JRE zip, leaving `bin/java` non-executable → D.Signer fails with
   `execve: Permission denied`. `dsigner` extracts with a mode-preserving helper.
+- **JRE JIT disabled (`-Xint`)** — under muvm/FEX the JVM's C1/C2 JIT emits x86
+  code FEX mistranslates, so D.Signer crashes with `SIGSEGV` in JIT-compiled
+  methods (e.g. `BigInteger.addOne`, `String.equals`) once they get hot — typically
+  the **3rd signature** (the first ones run in the interpreter). `dsigner` wraps the
+  bundled JRE's `bin/java` with a shim that forces interpreter-only mode
+  (`exec java.bin -Xint "$@"`); the HotSpot template interpreter is stable under
+  FEX. Verify with `java -version` showing `interpreted mode` (not `mixed mode`).
+  Signing is short, so the interpreter's slowdown is irrelevant.
 
 ## License / disclaimer
 
