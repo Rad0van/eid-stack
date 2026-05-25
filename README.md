@@ -26,15 +26,42 @@ with one command.
 | `dsigner` | Pre-fetches **D.Signer Java** + **Zulu JRE 21** into `~/.ditec/dlauncher2/products/` (exec bits preserved). |
 | `websigner` | **Disig WebSigner** — fetches/extracts its `amd64` `.deb` (no arm64 build exists and its own updater can't run here) and re-points it through muvm: tray autostart, menu entry, browser native-messaging hosts. **Needs sudo.** |
 
-## Requirements
+## Prerequisites & reproducing on a fresh box
 
-- **Asahi Linux on Apple Silicon** (aarch64).
-- **Python 3** (standard library only — no pip packages).
-- **`muvm`** in `PATH` (a custom build with pcscd/loopback/overcommit patches is
-  recommended; `muvm-service` symlinks `~/.local/bin/muvm-guest → ~/.cargo/bin/muvm-guest`).
-- **`socat`** — for the IPv6 loopback shim (skipped with a warning if absent).
-- **`sudo`** — required by `eid-klient` and `websigner` (run those from a real terminal).
-- **`dpkg-deb`** — for `websigner`.
+`eid-stack` only installs the eID *glue*; the x86-on-aarch64 substrate underneath
+must already exist. Run **`eid-stack deps`** to check it (or **`eid-stack deps install`**
+to install the automatable parts).
+
+The dependency chain: 16 KiB host pages → x86-64 binaries can't run on the host →
+a **4 KiB-page guest** is needed → that's **muvm** (a libkrun microVM) → inside it,
+x86 is emulated by **FEX** → FEX needs an **x86 RootFS** for base system libraries.
+
+| Layer | What it is | Modified? | Provided by |
+|---|---|---|---|
+| **muvm** | microVM launcher + in-guest init | **Yes — custom fork** | `git@github.com:Rad0van/muvm.git` (branch `pcscd`), `cargo build`, into `~/.cargo/bin` |
+| **libkrun / libkrunfw** | VM backend muvm links against | stock | Asahi gaming PPA (kaazoo) |
+| **FEX** | x86-64 emulation via binfmt | stock | `fex-emu-*` apt packages |
+| **FEX RootFS** | x86 system libs (glibc, ld.so, …) | stock | `FEXRootFSFetcher` (x86-64 Ubuntu) |
+| **socat** | IPv6 `localhost` shim | stock | `apt: socat` |
+| Python 3, cargo, sudo, dpkg-deb | tooling | — | distro |
+
+Only **muvm must be the custom fork** — its patches (pcscd vsock bridge, the port
+15480 loopback proxy, EPERM-tolerant stdin, `vm.overcommit_memory=1`) are what make
+the eID stack work. Everything else is stock plumbing. `muvm-service` keeps the
+`~/.local/bin/muvm-guest → ~/.cargo/bin/muvm-guest` PATH symlink so the host muvm
+finds the patched guest binary.
+
+```sh
+eid-stack deps              # report what's present / missing
+eid-stack deps install      # FEX + socat (apt), FEX RootFS (interactive fetcher),
+                            # and build+install the muvm fork
+# libkrun/libkrunfw come from the Asahi "gaming" PPA — add that PPA first if missing.
+eid-stack install           # then install the eID stack itself
+eid-stack list              # verify
+```
+
+`sudo` is needed for `deps install`, `eid-klient`, and `websigner` — run those from
+a real terminal.
 
 ## Usage
 
@@ -47,6 +74,7 @@ Commands:
   reinstall [comp...]   uninstall then install
   uninstall [comp...]   remove component(s)              (default: all installed)
   list                  show installed versions + update availability
+  deps      [install]   check (or install) the prerequisites above
   help                  show help
 
 Components: muvm-service  dlauncher  eid-klient  dsigner  websigner   (or "all")

@@ -17,14 +17,16 @@ Commands:
   reinstall [comp...]   uninstall then install
   uninstall [comp...]   remove component(s); default: all
   list                  show installed versions and update availability
+  deps      [install]   check (or install) prerequisites: FEX, FEX RootFS,
+                        libkrun(fw), the muvm fork, socat, cargo, dpkg-deb
   help                  show this message
 
 State is tracked in ~/.config/eid-stack/state.json (ETag/Last-Modified per
 download, install timestamps). Wrapper scripts at ~/bin/dBridge2Nm.sh and
 ~/bin/eID_Client.sh are written by this tool.
 
-Requires: muvm in PATH (any version) for AppImage extraction; sudo for
-eid-klient and websigner install/update/uninstall; dpkg-deb for websigner.
+Requires (see `eid-stack deps`): a muvm fork build, FEX + an x86_64 FEX RootFS,
+libkrun/libkrunfw, socat; sudo for eid-klient/websigner and `deps install`.
 """
 
 from __future__ import annotations
@@ -1432,6 +1434,128 @@ def cmd_update(comps: list[str]) -> None:
         cmd_reinstall(to_update)
 
 
+# === Prerequisites (deps) ================================================
+
+MUVM_REPO = HOME / "Programming/muvm"
+MUVM_FORK_URL = "git@github.com:Rad0van/muvm.git"
+MUVM_FORK_BRANCH = "pcscd"
+APT_FEX_PKGS = ["fex-emu-armv8.4", "fex-emu-binfmt64", "fex-emu-binfmt32"]
+
+
+def _have_so(stem: str) -> bool:
+    """True if a shared library lib<stem>.so* exists under /usr/lib."""
+    return any(Path("/usr/lib").glob(f"*/{stem}.so*")) or \
+           any(Path("/usr/lib").glob(f"{stem}.so*"))
+
+
+def _fex_rootfs() -> tuple[bool, str]:
+    cfg = HOME / ".fex-emu/Config.json"
+    if not cfg.exists():
+        return False, "no ~/.fex-emu/Config.json — run FEXRootFSFetcher"
+    try:
+        name = json.loads(cfg.read_text()).get("Config", {}).get("RootFS", "")
+    except Exception:
+        name = ""
+    if not name:
+        return False, "no RootFS selected in Config.json — run FEXRootFSFetcher"
+    base = HOME / ".fex-emu/RootFS"
+    if any((base / name).exists() for name in (name, f"{name}.sqsh", f"{name}.ero")):
+        return True, f"~/.fex-emu/RootFS/{name}"
+    return False, f"RootFS '{name}' configured but not present in ~/.fex-emu/RootFS"
+
+
+def _apt_install(pkgs: list[str]) -> None:
+    need_cmd("sudo")
+    need_cmd("apt-get")
+    run(["sudo", "apt-get", "install", "-y", *pkgs])
+
+
+def _fix_socat() -> None:
+    _apt_install(["socat"])
+
+
+def _fix_fex() -> None:
+    info("installing FEX (needs the FEX apt repo configured)")
+    _apt_install(APT_FEX_PKGS)
+
+
+def _fix_rootfs() -> None:
+    if not shutil.which("FEXRootFSFetcher"):
+        warn("FEXRootFSFetcher not in PATH — install FEX first, then re-run")
+        return
+    info("launching FEXRootFSFetcher (interactive — choose an x86_64 Ubuntu RootFS)")
+    run(["FEXRootFSFetcher"], check=False)
+
+
+def _fix_muvm() -> None:
+    need_cmd("cargo", "install Rust via rustup: https://rustup.rs")
+    need_cmd("git")
+    if not MUVM_REPO.exists():
+        info(f"cloning {MUVM_FORK_URL} (branch {MUVM_FORK_BRANCH}) -> {MUVM_REPO}")
+        MUVM_REPO.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", "-b", MUVM_FORK_BRANCH, MUVM_FORK_URL, str(MUVM_REPO)])
+    else:
+        info(f"using existing muvm checkout at {MUVM_REPO}")
+    info("building muvm (cargo build --release)")
+    run(["cargo", "build", "--release"], cwd=str(MUVM_REPO))
+    cargo_bin = HOME / ".cargo/bin"
+    cargo_bin.mkdir(parents=True, exist_ok=True)
+    for b in ("muvm", "muvm-guest"):
+        src = MUVM_REPO / "target/release" / b
+        if not src.exists():
+            die(f"build did not produce {src}")
+        shutil.copy2(src, cargo_bin / b)
+        (cargo_bin / b).chmod(0o755)
+    ok(f"installed muvm + muvm-guest to {cargo_bin}")
+
+
+def _deps() -> list[tuple]:
+    """[(name, ok, detail, fixer|None)]; fixer runs on `deps install`."""
+    cargo = shutil.which("cargo")
+    fex = shutil.which("FEXInterpreter")
+    rok, rdetail = _fex_rootfs()
+    muvm = bool((HOME / ".cargo/bin/muvm").exists() or shutil.which("muvm"))
+    socat = shutil.which("socat")
+    dpkgdeb = shutil.which("dpkg-deb")
+    return [
+        ("cargo (Rust; builds muvm)", bool(cargo),
+         cargo or "install Rust via rustup (https://rustup.rs)", None),
+        ("FEX (x86_64 emulation)", bool(fex),
+         fex or f"apt: {' '.join(APT_FEX_PKGS)}", _fix_fex),
+        ("FEX RootFS (x86 system libs)", rok, rdetail, _fix_rootfs),
+        ("libkrun (muvm VM backend)", _have_so("libkrun"),
+         "present" if _have_so("libkrun") else "missing — Asahi gaming PPA (see README)", None),
+        ("libkrunfw (VM kernel image)", _have_so("libkrunfw"),
+         "present" if _have_so("libkrunfw") else "missing — Asahi gaming PPA (see README)", None),
+        (f"muvm (fork, branch {MUVM_FORK_BRANCH})", muvm,
+         str(HOME / ".cargo/bin/muvm") if muvm else f"build from fork ({MUVM_FORK_URL})", _fix_muvm),
+        ("socat (IPv6 localhost shim)", bool(socat), socat or "apt: socat", _fix_socat),
+        ("dpkg-deb (WebSigner .deb)", bool(dpkgdeb), dpkgdeb or "apt: dpkg", None),
+    ]
+
+
+def cmd_deps(do_install: bool) -> None:
+    deps = _deps()
+    if do_install:
+        missing = [(n, fx) for (n, okk, _d, fx) in deps if not okk]
+        if not missing:
+            ok("all prerequisites already satisfied")
+        for name, fx in missing:
+            if fx is None:
+                warn(f"{name}: no automatic install — see `eid-stack deps`")
+                continue
+            info(f"=== installing: {name} ===")
+            fx()
+        deps = _deps()  # re-check after installing
+    info("prerequisite status:")
+    width = max(len(n) for (n, *_r) in deps)
+    for name, okk, detail, _fx in deps:
+        mark, color = ("✓", "green") if okk else ("✗", "red")
+        print(_c(f"  {mark} {name.ljust(width)}  {detail}", color), file=sys.stderr)
+    if not do_install and any(not okk for (_n, okk, _d, _f) in deps):
+        info("run `eid-stack deps install` to install the automatable ones")
+
+
 def parse_components(args: list[str], *, default_to: list[str]) -> list[str]:
     if not args or args == ["all"]:
         return list(default_to)
@@ -1444,9 +1568,9 @@ def parse_components(args: list[str], *, default_to: list[str]) -> list[str]:
 def main() -> None:
     p = argparse.ArgumentParser(prog="eid-stack", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["install", "update", "reinstall", "uninstall", "list", "help"],
+    p.add_argument("command", choices=["install", "update", "reinstall", "uninstall", "list", "deps", "help"],
                    help="action to perform")
-    p.add_argument("components", nargs="*", help="components (default: all)")
+    p.add_argument("components", nargs="*", help="components (default: all); for `deps`: optional 'install'")
     args = p.parse_args()
 
     if args.command == "help":
@@ -1454,6 +1578,12 @@ def main() -> None:
         return
     if args.command == "list":
         cmd_list()
+        return
+    if args.command == "deps":
+        sub = args.components
+        if sub and sub != ["install"]:
+            die("usage: eid-stack deps [install]")
+        cmd_deps(do_install=(sub == ["install"]))
         return
 
     if args.command in ("install", "reinstall"):
