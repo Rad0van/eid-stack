@@ -41,7 +41,7 @@ x86 is emulated by **FEX** → FEX needs an **x86 RootFS** for base system libra
 | **muvm** | microVM launcher + in-guest init | **Yes — custom fork** | `git@github.com:Rad0van/muvm.git` (branch `pcscd`), `cargo build`, into `~/.cargo/bin` |
 | **libkrun / libkrunfw** | VM backend muvm links against | stock | Asahi gaming PPA (kaazoo) |
 | **FEX** | x86-64 emulation via binfmt | stock | `fex-emu-*` apt packages |
-| **FEX RootFS** | x86 system libs (glibc, ld.so, …) | stock | `FEXRootFSFetcher` (x86-64 Ubuntu) |
+| **FEX RootFS** | x86 system libs (glibc, ld.so, …) | stock | **Ubuntu 25.10** Stage2 rootfs (see note) |
 | **socat** | IPv6 `localhost` shim | stock | `apt: socat` |
 | Python 3, cargo, sudo, dpkg-deb | tooling | — | distro |
 
@@ -51,9 +51,15 @@ the eID stack work. Everything else is stock plumbing. `muvm-service` keeps the
 `~/.local/bin/muvm-guest → ~/.cargo/bin/muvm-guest` PATH symlink so the host muvm
 finds the patched guest binary.
 
+> **RootFS note:** the DITEC stack only works with an **Ubuntu 25.10** x86-64 rootfs
+> here (24.04 fails), and FEX's official RootFS server has no 25.10 — so `deps install`
+> does **not** use `FEXRootFSFetcher`. It downloads a prebuilt 25.10 "Stage2" FEX rootfs
+> (community-hosted; `URL_FEX_ROOTFS` in the script), extracts it to
+> `~/.fex-emu/RootFS/Ubuntu_25_10`, and sets it as the default RootFS.
+
 ```sh
 eid-stack deps              # report what's present / missing
-eid-stack deps install      # FEX + socat (apt), FEX RootFS (interactive fetcher),
+eid-stack deps install      # FEX + socat (apt), the Ubuntu 25.10 FEX RootFS (download),
                             # and build+install the muvm fork
 # libkrun/libkrunfw come from the Asahi "gaming" PPA — add that PPA first if missing.
 eid-stack install           # then install the eID stack itself

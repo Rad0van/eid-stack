@@ -1441,6 +1441,13 @@ MUVM_FORK_URL = "git@github.com:Rad0van/muvm.git"
 MUVM_FORK_BRANCH = "pcscd"
 APT_FEX_PKGS = ["fex-emu-armv8.4", "fex-emu-binfmt64", "fex-emu-binfmt32"]
 
+# FEX's RootFS server has no Ubuntu 25.10, but the DITEC eID stack only works with
+# 25.10 on this box (24.04 fails). This is the community "Stage2" 25.10 x86_64 FEX
+# rootfs (a full GUI package set, not minimal ubuntu-base); the tarball extracts
+# flat into the RootFS dir.
+URL_FEX_ROOTFS = "https://kernelpanik.net/content/images/Stage2_ubuntu-base-25.10-base-amd64.tar.gz"
+FEX_ROOTFS_NAME = "Ubuntu_25_10"
+
 
 def _have_so(stem: str) -> bool:
     """True if a shared library lib<stem>.so* exists under /usr/lib."""
@@ -1451,17 +1458,31 @@ def _have_so(stem: str) -> bool:
 def _fex_rootfs() -> tuple[bool, str]:
     cfg = HOME / ".fex-emu/Config.json"
     if not cfg.exists():
-        return False, "no ~/.fex-emu/Config.json — run FEXRootFSFetcher"
+        return False, "no ~/.fex-emu/Config.json — `eid-stack deps install`"
     try:
         name = json.loads(cfg.read_text()).get("Config", {}).get("RootFS", "")
     except Exception:
         name = ""
     if not name:
-        return False, "no RootFS selected in Config.json — run FEXRootFSFetcher"
+        return False, "no RootFS selected in Config.json — `eid-stack deps install`"
     base = HOME / ".fex-emu/RootFS"
-    if any((base / name).exists() for name in (name, f"{name}.sqsh", f"{name}.ero")):
+    if any((base / cand).exists() for cand in (name, f"{name}.sqsh", f"{name}.ero")):
         return True, f"~/.fex-emu/RootFS/{name}"
     return False, f"RootFS '{name}' configured but not present in ~/.fex-emu/RootFS"
+
+
+def _set_fex_default_rootfs(name: str) -> None:
+    """Set Config.RootFS in ~/.fex-emu/Config.json, preserving other keys."""
+    cfg_path = HOME / ".fex-emu/Config.json"
+    cfg = {}
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            cfg = {}
+    cfg.setdefault("Config", {})["RootFS"] = name
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg))
 
 
 def _apt_install(pkgs: list[str]) -> None:
@@ -1480,11 +1501,24 @@ def _fix_fex() -> None:
 
 
 def _fix_rootfs() -> None:
-    if not shutil.which("FEXRootFSFetcher"):
-        warn("FEXRootFSFetcher not in PATH — install FEX first, then re-run")
+    dest = HOME / ".fex-emu/RootFS" / FEX_ROOTFS_NAME
+    if dest.exists():
+        info(f"RootFS dir already present: {dest} — setting as default only")
+        _set_fex_default_rootfs(FEX_ROOTFS_NAME)
+        ok(f"FEX RootFS default = {FEX_ROOTFS_NAME}")
         return
-    info("launching FEXRootFSFetcher (interactive — choose an x86_64 Ubuntu RootFS)")
-    run(["FEXRootFSFetcher"], check=False)
+    # FEXRootFSFetcher can't get 25.10 (not on the FEX server); fetch the Stage2 tarball.
+    # Extract with system `tar` (not tarfile's "data" filter, which would reject the
+    # absolute symlinks an OS rootfs legitimately contains) — same as a manual `tar -xf`.
+    need_cmd("tar")
+    with tempfile.TemporaryDirectory() as td:
+        tarball = Path(td) / "rootfs.tar.gz"
+        download(URL_FEX_ROOTFS, tarball)
+        info(f"extracting RootFS into {dest} (large — ~2.8 GB, takes a while)")
+        dest.mkdir(parents=True, exist_ok=True)
+        run(["tar", "-xzf", str(tarball), "-C", str(dest)])
+    _set_fex_default_rootfs(FEX_ROOTFS_NAME)
+    ok(f"installed FEX RootFS {FEX_ROOTFS_NAME} and set as default")
 
 
 def _fix_muvm() -> None:
