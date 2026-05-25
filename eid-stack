@@ -1,0 +1,1444 @@
+#!/usr/bin/env python3
+"""eid-stack: install/update/list/uninstall the DITEC eID signing stack on Linux.
+
+Components:
+  muvm-service  Persistent muvm microVM systemd user service + slim wrappers
+                + ~/.local/bin/muvm-guest symlink so PATH lookup finds our build
+  dlauncher     D.Launcher 2 (+ dBridge2Nm NM host + Brave/Chrome NM manifest)
+  eid-klient    Slovak eID Klient middleware (needs sudo, installs to /usr/lib/)
+  dsigner       Pre-fetch D.Signer Java + Zulu JRE 21 (auto-fetched otherwise)
+  websigner     Disig WebSigner: fetch/extract its amd64 .deb (no arm64 build
+                exists; its own updater can't run here) + re-point through muvm
+                — tray autostart, menu entry, browser native-messaging hosts
+
+Commands:
+  install   [comp...]   install component(s); default: all
+  update    [comp...]   re-download if upstream changed; default: all installed
+  reinstall [comp...]   uninstall then install
+  uninstall [comp...]   remove component(s); default: all
+  list                  show installed versions and update availability
+  help                  show this message
+
+State is tracked in ~/.config/eid-stack/state.json (ETag/Last-Modified per
+download, install timestamps). Wrapper scripts at ~/bin/dBridge2Nm.sh and
+~/bin/eID_Client.sh are written by this tool.
+
+Requires: muvm in PATH (any version) for AppImage extraction; sudo for
+eid-klient and websigner install/update/uninstall; dpkg-deb for websigner.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import textwrap
+import urllib.error
+import urllib.request
+import zipfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+from xml.etree import ElementTree as ET
+
+
+# === Constants ============================================================
+
+HOME = Path.home()
+
+URL_DLAUNCHER = "https://www.slovensko.sk/static/kep/apps/dlauncher2_2.x/DLauncher2.linux.x86_64.run"
+URL_EID_KLIENT = "https://eidas.minv.sk/downloadservice/eidklient/linux/eID_klient_x86_64.tar.gz"
+URL_DSIGNER_XML = "https://www.slovensko.sk/static/kep/apps/java/dsigner_3.x/sk.ditec.ep.products.dsigner.java.xml"
+URL_DJRE_XML = "https://www.slovensko.sk/static/kep/apps/java/djre21/sk.ditec.djre21.xml"
+
+DLAUNCHER_ROOT = HOME / ".local/share/dlauncher2"
+DLAUNCHER_DITEC = HOME / ".ditec/dlauncher2"
+DLAUNCHER_INSTALL_XML = DLAUNCHER_DITEC / "installation.xml"
+DLAUNCHER_PRODUCTS = DLAUNCHER_DITEC / "products"
+
+EID_KLIENT_ROOT = Path("/usr/lib/eID_klient")
+EID_KLIENT_PKCS11_LINK = EID_KLIENT_ROOT / "libpkcs11_x64.so"
+EID_KLIENT_PKCS11_REAL = "lib/libpkcs11_x64.so"
+# eID_Client looks up VirtualKeyboard via LD_LIBRARY_PATH (=…/lib); the AppImage
+# layout puts the binary at the install root, so we symlink it into lib/ too.
+EID_KLIENT_VK_LINK = EID_KLIENT_ROOT / "lib/VirtualKeyboard"
+EID_KLIENT_VK_REAL = "/usr/lib/eID_klient/VirtualKeyboard"
+
+# Disig WebSigner — a separate vendor's signing tool. Disig ships only amd64 /
+# i386 .deb builds (no arm64), and WebSigner's own updater can't run on this box
+# (it shells out to gdebi to install an amd64 package — see update_websigner_deb).
+# So eid-stack fetches the .deb itself and extracts its payload over /opt/disig/,
+# then re-points the launchers through muvm (the x86_64 binaries hit
+# "<jemalloc>: Unsupported system page size" on a 16K-page host otherwise).
+WEBSIGNER_ROOT = Path("/opt/disig/websigner")
+URL_WEBSIGNER_DEB = "https://download.disigcdn.sk/cdn/products/websigner2/disig-web-signer_amd64.deb"
+URL_WEBSIGNER_VERSION_XML = "https://update.disigcdn.sk/cdn/products/websigner2/version-linux.xml"
+WEBSIGNER_AUTOSTART = HOME / ".config/autostart/sk.disig.WebSigner.desktop"
+
+SYSTEMD_UNIT = HOME / ".config/systemd/user/dlauncher2-muvm.service"
+SHIM_UNIT = HOME / ".config/systemd/user/eid-ipv6-shim.service"
+WRAPPER_DBRIDGE = HOME / "bin/dBridge2Nm.sh"
+WRAPPER_EID = HOME / "bin/eID_Client.sh"
+WRAPPER_WEBSIGNER_TRAY = HOME / "bin/WebSignerTray.sh"
+WRAPPER_WEBSIGNER_NM = HOME / "bin/WebSigner.sh"
+MUVM_GUEST_SYMLINK = HOME / ".local/bin/muvm-guest"
+
+DESKTOP_DIR = HOME / ".local/share/applications"
+ICON_HICOLOR = HOME / ".local/share/icons/hicolor"
+
+# User-level menu entry that shadows the root-owned
+# /usr/share/applications/sk.disig.WebSigner.desktop (the .deb keeps resetting
+# the system one to exec the native x86_64 binary — see fix_websigner_menu_entry).
+WEBSIGNER_MENU_ENTRY = DESKTOP_DIR / "sk.disig.WebSigner.desktop"
+
+DBRIDGE_EXTENSIONS = [
+    "fngbdhimbgbonhlibfmiemipheabfdmj",
+    "japafgjbmccagfkbllkgmnafbcoofccp",
+]
+NM_NAME = "sk.ditec.dbridge2.nm"
+NM_BROWSERS = {
+    "brave":         HOME / ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts",
+    "chrome":        HOME / ".config/google-chrome/NativeMessagingHosts",
+    "chromium":      HOME / ".config/chromium/NativeMessagingHosts",
+    "chromium-snap": HOME / "snap/chromium/common/chromium/NativeMessagingHosts",
+}
+FIREFOX_NM_DIR = HOME / ".mozilla/native-messaging-hosts"
+
+STATE_FILE = HOME / ".config/eid-stack/state.json"
+
+ALL_COMPONENTS = ["muvm-service", "dlauncher", "eid-klient", "dsigner", "websigner"]
+INSTALL_ORDER = ["muvm-service", "dlauncher", "eid-klient", "dsigner", "websigner"]
+UNINSTALL_ORDER = list(reversed(INSTALL_ORDER))
+
+
+# === Output helpers =======================================================
+
+def _isatty() -> bool:
+    return sys.stderr.isatty()
+
+def _c(msg: str, color: str) -> str:
+    if not _isatty():
+        return msg
+    codes = {"red": 31, "green": 32, "yellow": 33, "blue": 34, "gray": 90, "bold": 1}
+    return f"\033[{codes[color]}m{msg}\033[0m"
+
+def info(msg: str) -> None:
+    print(_c("→ ", "blue") + msg, file=sys.stderr)
+
+def ok(msg: str) -> None:
+    print(_c("✓ ", "green") + msg, file=sys.stderr)
+
+def warn(msg: str) -> None:
+    print(_c("! ", "yellow") + msg, file=sys.stderr)
+
+def die(msg: str, code: int = 1) -> "Never":  # type: ignore[valid-type]
+    print(_c("✗ ", "red") + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# === Subprocess helpers ===================================================
+
+def run(cmd, *, check: bool = True, capture: bool = False, **kw) -> subprocess.CompletedProcess:
+    if isinstance(cmd, str):
+        echo = cmd
+        kw.setdefault("shell", True)
+    else:
+        cmd = [str(c) for c in cmd]
+        echo = " ".join(cmd)
+    print(_c(f"  $ {echo}", "gray"), file=sys.stderr)
+    return subprocess.run(cmd, check=check, capture_output=capture, text=True, **kw)
+
+
+def run_in_vm(script: str) -> subprocess.CompletedProcess:
+    """Run a bash snippet inside the muvm VM. Uses pipe stdin to avoid the
+    EPERM that `muvm -i` raises with regular-file stdin."""
+    return subprocess.run(
+        ["muvm", "-i", "--", "bash", "-c", script],
+        check=True, text=True,
+        input="",   # forces a pipe stdin (not /dev/null)
+    )
+
+
+def need_cmd(name: str, hint: str = "") -> None:
+    if not shutil.which(name):
+        msg = f"required command not in PATH: {name}"
+        if hint:
+            msg += f"\n   hint: {hint}"
+        die(msg)
+
+
+# === HTTP helpers =========================================================
+
+USER_AGENT = "eid-stack/1.0 (+https://www.slovensko.sk)"
+
+def http_get(url: str) -> tuple[bytes, dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read(), dict(r.headers)
+
+def http_head(url: str) -> dict:
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return dict(r.headers)
+    except urllib.error.HTTPError as e:
+        if e.code == 405:  # method not allowed → fall back to a 1-byte GET
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return dict(r.headers)
+        raise
+
+def download(url: str, dest: Path) -> dict:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    info(f"download {url}")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        headers = dict(r.headers)
+        got = 0
+        last = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if total and _isatty() and got - last > 2 * 1024 * 1024:
+                    print(_c(f"    {got//1024//1024} / {total//1024//1024} MB", "gray"),
+                          file=sys.stderr, end="\r")
+                    last = got
+        if _isatty():
+            print(" " * 40, file=sys.stderr, end="\r")
+    return headers
+
+
+# === State ================================================================
+
+def state_load() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            warn(f"corrupt state file at {STATE_FILE}; ignoring")
+    return {}
+
+def state_save(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+def state_set(component: str, **fields) -> None:
+    s = state_load()
+    entry = s.setdefault(component, {})
+    entry.update(fields)
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    state_save(s)
+
+def state_drop(component: str) -> None:
+    s = state_load()
+    s.pop(component, None)
+    state_save(s)
+
+
+# === AppImage extraction ==================================================
+
+def appimage_extract(appimage_path: Path, dest_dir: Path) -> None:
+    """Run AppImage --appimage-extract inside the muvm VM (x86_64 via FEX).
+    The AppImage extracts into ./squashfs-root/ in cwd; we then rsync to
+    dest_dir (replacing it)."""
+    appimage_path = appimage_path.resolve()
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+    appimage_path.chmod(0o755)
+    with tempfile.TemporaryDirectory(prefix="eid-stack-ax-") as td:
+        info(f"extract AppImage {appimage_path.name} (in muvm)")
+        run_in_vm(
+            f"cd '{td}' && '{appimage_path}' --appimage-extract >/dev/null"
+        )
+        src = Path(td) / "squashfs-root"
+        if not src.is_dir():
+            die(f"AppImage extraction did not produce {src}")
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        # Use rsync if available (preserves symlinks and is fast); otherwise copytree.
+        if shutil.which("rsync"):
+            run(["rsync", "-a", f"{src}/", f"{dest_dir}/"])
+        else:
+            shutil.copytree(src, dest_dir, symlinks=True)
+
+
+# === Desktop integration ==================================================
+
+def write_desktop_file(path: Path, **fields) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "[Desktop Entry]\n"
+    for k, v in fields.items():
+        body += f"{k}={v}\n"
+    path.write_text(body)
+    path.chmod(0o644)
+
+def refresh_desktop_db() -> None:
+    for cmd in (["update-desktop-database", str(DESKTOP_DIR)],
+                ["gtk-update-icon-cache", "-t", str(ICON_HICOLOR)]):
+        if shutil.which(cmd[0]):
+            try:
+                run(cmd, check=False, capture=True)
+            except Exception:
+                pass
+
+
+# === SHA256 ================================================================
+
+def sha256_b64(data: bytes) -> str:
+    return base64.b64encode(hashlib.sha256(data).digest()).decode()
+
+def sha256_b64_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return base64.b64encode(h.digest()).decode()
+
+
+# === Component: muvm-service ==============================================
+
+SYSTEMD_UNIT_BODY = """\
+[Unit]
+Description=DLauncher2 persistent muvm microVM (x86_64 emulation host)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# passt bound IPv4-only (127.0.0.1) so eid-ipv6-shim.service can own ::1:15480.
+# Brave/Chromium resolve localhost->::1 first; a dual-stack passt accepts the
+# IPv6 connection but never forwards it, so the portal reports "eID not running".
+ExecStart=%h/.cargo/bin/muvm --mem=4096 -p=127.0.0.1:15480:15480 -- /bin/sleep infinity
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+# IPv6 loopback shim: forwards ::1:15480 -> 127.0.0.1:15480 (passt) so that
+# Brave/Chromium, which hit localhost->::1 first, reach eID Klient. %SOCAT% is
+# substituted with the resolved socat path at install time.
+SHIM_UNIT_BODY = """\
+[Unit]
+Description=eID Klient IPv6 loopback shim (::1:15480 -> 127.0.0.1:15480)
+After=dlauncher2-muvm.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%SOCAT% TCP6-LISTEN:15480,bind=[::1],fork,reuseaddr TCP4:127.0.0.1:15480
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+WRAPPER_DBRIDGE_BODY = """\
+#!/bin/sh
+# Chrome native messaging host for D.Bridge 2.
+# Generated by eid-stack. Edits will be overwritten on update/reinstall.
+#
+# muvm-guest now sets PCSCLITE_CSOCK_NAME and bridges pcscd automatically,
+# so this wrapper only logs a debug header and dispatches.
+
+LOG=/tmp/dBridge2Nm.log
+{
+    echo "----"
+    date '+%F %T.%3N wrapper invoked'
+    echo "argv: $0 $*"
+    echo "uid:$(id -u) HOME=$HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+} >>"$LOG" 2>&1
+
+exec %MUVM% -i -- %DBRIDGE_BIN% "$@" 2>>"$LOG"
+"""
+
+WRAPPER_EID_BODY = """\
+#!/bin/sh
+# Launch Slovak eID Klient inside the persistent muvm microVM.
+# Generated by eid-stack. Edits will be overwritten on update/reinstall.
+
+exec %MUVM% -i -- env \\
+    LD_LIBRARY_PATH=%EID_ROOT%/lib \\
+    QT_QPA_PLATFORM_PLUGIN_PATH=%EID_ROOT%/plugins \\
+    QT_QPA_PLATFORM=xcb \\
+    %EID_ROOT%/eID_Client "$@"
+"""
+
+
+def muvm_path() -> Path:
+    """The muvm binary path baked into wrapper scripts. Prefer ~/.cargo/bin
+    if present (user's custom build), else whatever's in PATH."""
+    cand = HOME / ".cargo/bin/muvm"
+    if cand.exists():
+        return cand
+    p = shutil.which("muvm")
+    if not p:
+        die("muvm not found in PATH. Install muvm first (system pkg or cargo build).")
+    return Path(p)
+
+
+def systemctl_user(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["systemctl", "--user", *args], check=check)
+
+
+def install_muvm_service() -> None:
+    need_cmd("systemctl")
+    need_cmd("muvm", "install muvm (system pkg or cargo install --path crates/muvm)")
+
+    # PATH-discoverability: ensure ~/.local/bin/muvm-guest -> ~/.cargo/bin/muvm-guest
+    cargo_guest = HOME / ".cargo/bin/muvm-guest"
+    if cargo_guest.exists():
+        MUVM_GUEST_SYMLINK.parent.mkdir(parents=True, exist_ok=True)
+        if MUVM_GUEST_SYMLINK.is_symlink() or MUVM_GUEST_SYMLINK.exists():
+            MUVM_GUEST_SYMLINK.unlink()
+        MUVM_GUEST_SYMLINK.symlink_to(cargo_guest)
+        ok(f"symlinked {MUVM_GUEST_SYMLINK} → {cargo_guest}")
+    else:
+        warn(f"{cargo_guest} not found; not creating PATH symlink. "
+             f"The system muvm-guest (if any) will be used instead, "
+             f"which may not have pcscd/loopback bridging.")
+
+    # systemd units
+    SYSTEMD_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_UNIT.write_text(SYSTEMD_UNIT_BODY)
+    ok(f"wrote {SYSTEMD_UNIT}")
+
+    # IPv6 loopback shim (see SHIM_UNIT_BODY). Needs socat on the host.
+    socat = shutil.which("socat")
+    if socat:
+        SHIM_UNIT.write_text(SHIM_UNIT_BODY.replace("%SOCAT%", socat))
+        ok(f"wrote {SHIM_UNIT}")
+    else:
+        warn("socat not found; skipping eid-ipv6-shim.service. Brave/Chromium "
+             "'localhost' (IPv6 ::1) won't reach eID Klient and portals may report "
+             "'eID not running'. Install socat and re-run `eid-stack reinstall muvm-service`.")
+
+    systemctl_user("daemon-reload")
+    systemctl_user("enable", "dlauncher2-muvm.service")
+    # Restart muvm first so passt rebinds IPv4-only and frees ::1 for the shim.
+    systemctl_user("restart", "dlauncher2-muvm.service")
+    ok("muvm service started")
+    if socat:
+        systemctl_user("enable", "eid-ipv6-shim.service")
+        systemctl_user("restart", "eid-ipv6-shim.service")
+        ok("eid-ipv6-shim service started")
+
+    state_set("muvm-service", source="local")
+
+
+def uninstall_muvm_service() -> None:
+    if SHIM_UNIT.exists():
+        systemctl_user("stop", "eid-ipv6-shim.service", check=False)
+        systemctl_user("disable", "eid-ipv6-shim.service", check=False)
+        SHIM_UNIT.unlink()
+        ok(f"removed {SHIM_UNIT}")
+    if SYSTEMD_UNIT.exists():
+        systemctl_user("stop", "dlauncher2-muvm.service", check=False)
+        systemctl_user("disable", "dlauncher2-muvm.service", check=False)
+        SYSTEMD_UNIT.unlink()
+        systemctl_user("daemon-reload", check=False)
+        ok(f"removed {SYSTEMD_UNIT}")
+    if MUVM_GUEST_SYMLINK.is_symlink():
+        MUVM_GUEST_SYMLINK.unlink()
+        ok(f"removed {MUVM_GUEST_SYMLINK}")
+    state_drop("muvm-service")
+
+
+def status_muvm_service() -> dict:
+    out = {"installed": SYSTEMD_UNIT.exists(), "active": False,
+           "guest_symlink": MUVM_GUEST_SYMLINK.is_symlink(),
+           "shim_installed": SHIM_UNIT.exists(), "shim_active": False}
+    if out["installed"]:
+        # Bypass run() so neither the "$ systemctl …" trace nor systemctl's own
+        # "active" stdout leak into `list` output.
+        r = subprocess.run(["systemctl", "--user", "is-active", "dlauncher2-muvm.service"],
+                           capture_output=True, text=True, check=False)
+        out["active"] = (r.returncode == 0)
+    if out["shim_installed"]:
+        r = subprocess.run(["systemctl", "--user", "is-active", "eid-ipv6-shim.service"],
+                           capture_output=True, text=True, check=False)
+        out["shim_active"] = (r.returncode == 0)
+    return out
+
+
+# === Component: D.Launcher ================================================
+
+def write_nm_manifests() -> list[Path]:
+    manifest = {
+        "name": NM_NAME,
+        "description": "D.Bridge 2 native messaging host",
+        "path": str(WRAPPER_DBRIDGE),
+        "type": "stdio",
+        "allowed_origins": [f"chrome-extension://{e}/" for e in DBRIDGE_EXTENSIONS],
+    }
+    body = json.dumps(manifest, indent=2) + "\n"
+    written = []
+    for name, dirpath in NM_BROWSERS.items():
+        if dirpath.parent.parent.exists() or name == "brave":
+            # write into any browser whose root config exists, OR brave (we recommend it)
+            dirpath.mkdir(parents=True, exist_ok=True)
+            target = dirpath / f"{NM_NAME}.json"
+            target.write_text(body)
+            target.chmod(0o644)
+            written.append(target)
+            ok(f"wrote NM manifest: {target}")
+    return written
+
+
+def install_dlauncher() -> None:
+    need_cmd("muvm")
+
+    with tempfile.TemporaryDirectory(prefix="eid-stack-dl-") as td:
+        run_path = Path(td) / "DLauncher2.run"
+        headers = download(URL_DLAUNCHER, run_path)
+
+        appimage_extract(run_path, DLAUNCHER_ROOT)
+
+        # The D.Launcher 2.x AppImage nests its real payload under an inner
+        # dlauncher2/ dir (its AppRun execs $HERE/dlauncher2/dLauncher2), but our
+        # installation.xml <Path> and the NM wrapper expect dLauncher2/dBridge2Nm
+        # at DLAUNCHER_ROOT top level (binaries find their Qt libs as siblings via
+        # $ORIGIN, which still holds after the move). Flatten the inner dir up if
+        # the binary didn't land at the top. No-op for a flat AppImage.
+        if not (DLAUNCHER_ROOT / "dLauncher2").exists():
+            inner = next((p.parent for p in DLAUNCHER_ROOT.glob("*/dLauncher2")), None)
+            if inner is None:
+                die("dLauncher2 binary not found after AppImage extraction")
+            info(f"flattening nested payload {inner.name}/ → top level")
+            for item in list(inner.iterdir()):
+                target = DLAUNCHER_ROOT / item.name
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+                shutil.move(str(item), str(target))
+            inner.rmdir()
+        ok(f"installed D.Launcher → {DLAUNCHER_ROOT}")
+
+        # Detect version from the embedded AppRun or a binary if available.
+        version = detect_dlauncher_version(DLAUNCHER_ROOT)
+        if version:
+            ok(f"detected D.Launcher version {version}")
+        else:
+            version = "2.x"
+            warn("could not detect D.Launcher version; using '2.x' placeholder")
+
+        # installation.xml
+        DLAUNCHER_INSTALL_XML.parent.mkdir(parents=True, exist_ok=True)
+        install_xml_body = textwrap.dedent(f"""\
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Installation xmlns="http://www.ditec.sk/ep/products/dlauncher/configuration/installation/v1.0">
+                <Version>{version}</Version>
+                <Path>{DLAUNCHER_ROOT}/dLauncher2</Path>
+            </Installation>
+            """)
+        DLAUNCHER_INSTALL_XML.write_text(install_xml_body)
+        ok(f"wrote {DLAUNCHER_INSTALL_XML}")
+
+        # Wrapper
+        WRAPPER_DBRIDGE.parent.mkdir(parents=True, exist_ok=True)
+        body = (WRAPPER_DBRIDGE_BODY
+                .replace("%MUVM%", str(muvm_path()))
+                .replace("%DBRIDGE_BIN%", str(DLAUNCHER_ROOT / "dBridge2Nm")))
+        WRAPPER_DBRIDGE.write_text(body)
+        WRAPPER_DBRIDGE.chmod(0o755)
+        ok(f"wrote wrapper {WRAPPER_DBRIDGE}")
+
+        # NM manifests
+        write_nm_manifests()
+
+        info("D.Bridge 2 browser extension must be installed manually:")
+        info("    Chrome/Brave: https://chrome.google.com/webstore/detail/dbridge-2/fngbdhimbgbonhlibfmiemipheabfdmj")
+        info("    Firefox:      https://addons.mozilla.org/sk/firefox/addon/d-bridge-2/")
+
+    state_set("dlauncher",
+              source=URL_DLAUNCHER,
+              version=version,
+              etag=headers.get("ETag"),
+              last_modified=headers.get("Last-Modified"))
+
+
+def uninstall_dlauncher() -> None:
+    paths = [DLAUNCHER_ROOT, DLAUNCHER_INSTALL_XML, WRAPPER_DBRIDGE]
+    for d in NM_BROWSERS.values():
+        p = d / f"{NM_NAME}.json"
+        if p.exists():
+            paths.append(p)
+    for p in paths:
+        remove_path(p)
+    state_drop("dlauncher")
+
+
+def detect_dlauncher_version(root: Path) -> Optional[str]:
+    """Look for a version string in metadata / AppRun / .desktop."""
+    for cand in [root / "dlauncher2.desktop", root / ".version", root / "AppRun"]:
+        if cand.exists():
+            try:
+                text = cand.read_text(errors="ignore")
+            except Exception:
+                continue
+            m = re.search(r"\b(2\.\d+\.\d+\.\d+)\b", text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def status_dlauncher() -> dict:
+    if not DLAUNCHER_ROOT.exists():
+        return {"installed": False}
+    version = None
+    if DLAUNCHER_INSTALL_XML.exists():
+        try:
+            t = DLAUNCHER_INSTALL_XML.read_text()
+            m = re.search(r"<Version>([^<]+)</Version>", t)
+            if m:
+                version = m.group(1)
+        except Exception:
+            pass
+    return {"installed": True, "version": version, "wrapper": WRAPPER_DBRIDGE.exists()}
+
+
+# === Component: eID Klient ================================================
+
+def install_eid_klient() -> None:
+    need_cmd("sudo")
+    need_cmd("muvm")
+    info("eID Klient installs to /usr/lib/eID_klient/ — you'll be prompted for sudo.")
+
+    with tempfile.TemporaryDirectory(prefix="eid-stack-ek-") as td:
+        tar_path = Path(td) / "eID_klient.tar.gz"
+        headers = download(URL_EID_KLIENT, tar_path)
+
+        # The tar.gz contains a single AppImage (and maybe a checksum file).
+        info("extracting tar.gz")
+        with tarfile.open(tar_path) as tf:
+            tf.extractall(td, filter="data")
+        appimages = list(Path(td).rglob("*.AppImage"))
+        if not appimages:
+            die("no .AppImage found in tar.gz")
+        appimage = appimages[0]
+        info(f"found {appimage.name}")
+        # Try to parse version from filename: only accept VERSION_LIKE captures,
+        # because in practice the bundled name is e.g. eID_klient_x86_64.AppImage
+        # (platform suffix, not version). The libCardAPI.so scan below is the
+        # canonical source.
+        m_ver = re.search(r"eID_klient[_\-]([0-9][\w.\-]*?)\.AppImage", appimage.name)
+        version_from_name = m_ver.group(1) if m_ver else None
+
+        # Extract via muvm into a staging dir, then sudo-move
+        stage = Path(td) / "stage"
+        appimage_extract(appimage, stage)
+
+        # Move into /usr/lib/eID_klient/ via sudo
+        if EID_KLIENT_ROOT.exists():
+            info(f"removing existing {EID_KLIENT_ROOT}")
+            run(["sudo", "rm", "-rf", str(EID_KLIENT_ROOT)])
+        run(["sudo", "mkdir", "-p", str(EID_KLIENT_ROOT)])
+        run(["sudo", "cp", "-a", *[str(p) for p in stage.iterdir()], str(EID_KLIENT_ROOT) + "/"])
+        run(["sudo", "chown", "-R", "root:root", str(EID_KLIENT_ROOT)])
+        ok(f"installed eID Klient → {EID_KLIENT_ROOT}")
+
+        # PKCS11 path symlink (hardcoded path in DITEC's jar)
+        run(["sudo", "ln", "-sf", EID_KLIENT_PKCS11_REAL, str(EID_KLIENT_PKCS11_LINK)])
+        ok(f"symlinked {EID_KLIENT_PKCS11_LINK} → {EID_KLIENT_PKCS11_REAL}")
+
+        # VirtualKeyboard symlink (eID_Client looks it up via LD_LIBRARY_PATH=lib/)
+        run(["sudo", "ln", "-sf", EID_KLIENT_VK_REAL, str(EID_KLIENT_VK_LINK)])
+        ok(f"symlinked {EID_KLIENT_VK_LINK} → {EID_KLIENT_VK_REAL}")
+
+        # Desktop integration: extract share.tar if present, install .desktop + icons (user-side)
+        share_tar = EID_KLIENT_ROOT / "share.tar"
+        if share_tar.exists():
+            with tempfile.TemporaryDirectory(prefix="eid-share-") as sd:
+                run(["tar", "-xf", str(share_tar), "-C", sd])
+                install_eid_icons(Path(sd))
+
+        # SVG fallback icon (script-level) — copies the high-res logo to a stable name
+        svg = EID_KLIENT_ROOT / "sk_logo.svg"
+        if svg.exists():
+            target = ICON_HICOLOR / "scalable/apps/eid-klient.svg"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(svg, target)
+
+        # .desktop
+        write_desktop_file(
+            DESKTOP_DIR / "eid-klient.desktop",
+            Type="Application",
+            Name="eID klient",
+            **{"Name[sk]": "eID klient"},
+            GenericName="Slovak electronic ID middleware",
+            Comment="Slovak eID middleware (DITEC)",
+            Exec=str(WRAPPER_EID),
+            Icon="eid-klient",
+            Categories="Office;Security;X-DITEC;",
+            Terminal="false",
+        )
+        ok(f"wrote {DESKTOP_DIR / 'eid-klient.desktop'}")
+
+        # Wrapper
+        WRAPPER_EID.parent.mkdir(parents=True, exist_ok=True)
+        body = (WRAPPER_EID_BODY
+                .replace("%MUVM%", str(muvm_path()))
+                .replace("%EID_ROOT%", str(EID_KLIENT_ROOT)))
+        WRAPPER_EID.write_text(body)
+        WRAPPER_EID.chmod(0o755)
+        ok(f"wrote wrapper {WRAPPER_EID}")
+
+    refresh_desktop_db()
+
+    # libCardAPI.so is authoritative (CardAPI prints this string at runtime).
+    # Filename is a weak fallback because the bundled AppImage often only has
+    # a platform suffix in its name.
+    state_set("eid-klient", source=URL_EID_KLIENT, version=None,
+              etag=headers.get("ETag"),
+              last_modified=headers.get("Last-Modified"))
+    version = detect_eid_version() or version_from_name or "unknown"
+    state_set("eid-klient", version=version)
+    ok(f"eID Klient version: {version}")
+
+
+def install_eid_icons(share_root: Path) -> None:
+    """Copy icons from extracted share.tar into ~/.local/share/icons/hicolor/."""
+    src = share_root / "share/icons/hicolor"
+    if not src.is_dir():
+        return
+    count = 0
+    for size_dir in src.iterdir():
+        if not size_dir.is_dir():
+            continue
+        for app_icon in (size_dir / "apps").glob("sk_logo.png"):
+            dst = ICON_HICOLOR / size_dir.name / "apps" / "eid-klient.png"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(app_icon, dst)
+            count += 1
+    if count:
+        ok(f"installed {count} icon size(s) for eID klient")
+
+
+def uninstall_eid_klient() -> None:
+    if EID_KLIENT_ROOT.exists():
+        if shutil.which("sudo"):
+            run(["sudo", "rm", "-rf", str(EID_KLIENT_ROOT)])
+            ok(f"removed {EID_KLIENT_ROOT}")
+        else:
+            warn(f"sudo not available; cannot remove {EID_KLIENT_ROOT}")
+    remove_path(WRAPPER_EID)
+    remove_path(DESKTOP_DIR / "eid-klient.desktop")
+    # Remove user-installed icons we placed
+    for size in ICON_HICOLOR.iterdir() if ICON_HICOLOR.exists() else []:
+        for p in (size / "apps").glob("eid-klient.*"):
+            p.unlink(missing_ok=True)
+    refresh_desktop_db()
+    state_drop("eid-klient")
+
+
+def detect_eid_version() -> Optional[str]:
+    """Prefer state.json (captured at install time from the AppImage filename);
+    fall back to scanning libCardAPI.so for the version literal that CardAPI
+    prints as 'CardAPI, version: %s' at runtime (e.g. 'v5.3_RC2').
+    Other v5.x tokens in the same binary are card-profile compatibility checks
+    (v5.0, v5.4, v6.0, …) — we filter to a tagged form (_RC, _GA, _beta) and
+    only fall back to a bare X.Y.Z if no tagged form is present."""
+    saved = state_load().get("eid-klient", {}).get("version")
+    if saved:
+        return saved
+    card_api = EID_KLIENT_ROOT / "lib/libCardAPI.so"
+    if not card_api.exists():
+        return None
+    try:
+        data = card_api.read_bytes()
+    except Exception:
+        return None
+    tagged = re.findall(rb"v(\d+\.\d+[_-](?:RC|GA|alpha|beta|rc)\d+)", data, re.IGNORECASE)
+    if tagged:
+        return tagged[0].decode().replace("_", " ")
+    # Fall back: prefer X.Y.Z over bare X.Y (the latter are profile checks)
+    xyz = re.findall(rb"\bv(\d+\.\d+\.\d+)\b", data)
+    if xyz:
+        return xyz[0].decode()
+    return None
+
+
+def status_eid_klient() -> dict:
+    return {
+        "installed": EID_KLIENT_ROOT.exists(),
+        "version": detect_eid_version(),
+        "wrapper": WRAPPER_EID.exists(),
+        "pkcs11_link": EID_KLIENT_PKCS11_LINK.is_symlink(),
+        "vk_link": EID_KLIENT_VK_LINK.is_symlink(),
+    }
+
+
+# === Component: D.Signer pre-fetch ========================================
+
+NS_DNLP = {"d": "http://www.ditec.sk/ep/products/dlauncher/configuration/dnlp/v1.0"}
+
+def parse_dnlp(xml_bytes: bytes) -> dict:
+    """Parse a DITEC product .xml (DNLP manifest)."""
+    root = ET.fromstring(xml_bytes)
+    # Strip namespace for resilience to schema tweaks
+    def loc(tag): return tag.rsplit("}", 1)[-1]
+    out = {"product_id": None, "version": None, "archives": [], "depends": []}
+    for el in root.iter():
+        t = loc(el.tag)
+        if t == "Product":
+            out["product_id"] = el.get("id") or out["product_id"]
+            out["version"] = el.get("version") or out["version"]
+        if t == "Id" and out["product_id"] is None:
+            out["product_id"] = (el.text or "").strip() or None
+        if t == "Version" and out["version"] is None:
+            out["version"] = (el.text or "").strip() or None
+        if t == "Archive":
+            # DITEC's DNLP uses element text for filename, attribute for sha256/platform
+            href = el.get("href") or (el.text or "").strip()
+            platform = el.get("platform") or ""
+            sha = el.get("sha256") or (el.findtext(".//{*}Sha256") or "").strip()
+            if href:
+                out["archives"].append({"href": href, "platform": platform, "sha256": sha})
+        if t == "Depends" or t == "Dependency":
+            href = el.get("href") or (el.text or "").strip()
+            if href:
+                out["depends"].append(href)
+    return out
+
+
+def extract_zip(zip_path: Path, dest: Path) -> None:
+    """Extract a zip, restoring the unix permission bits stored in each entry
+    (masked by umask, like unzip(1)). zipfile.extractall() ignores stored modes
+    and falls back to umask defaults, which strips +x from the Zulu JRE binaries
+    (bin/java, keytool, lib/jspawnhelper, lib/jexec) — D.Signer then dies with
+    'execve: Permission denied' when it launches java."""
+    umask = os.umask(0)
+    os.umask(umask)
+    with zipfile.ZipFile(zip_path) as zf:
+        for zi in zf.infolist():
+            out = Path(zf.extract(zi, dest))
+            mode = (zi.external_attr >> 16) & 0o7777
+            if mode:
+                out.chmod(mode & ~umask)
+
+
+def install_dsigner() -> None:
+    """Pre-fetch D.Signer Java + Zulu JRE 21 into ~/.ditec/dlauncher2/products/.
+    Best-effort: D.Launcher may still re-verify on first sign, but the files
+    will already be present locally."""
+    info("pre-fetching D.Signer Java + Zulu JRE 21")
+
+    versions = {}
+    for label, url in [("dsigner", URL_DSIGNER_XML), ("djre", URL_DJRE_XML)]:
+        xml_bytes, _ = http_get(url)
+        manifest = parse_dnlp(xml_bytes)
+        if not manifest["product_id"] or not manifest["version"]:
+            die(f"failed to parse manifest at {url}")
+        info(f"{manifest['product_id']} version {manifest['version']}")
+        product_dir = DLAUNCHER_PRODUCTS / manifest["product_id"] / manifest["version"]
+        product_dir.mkdir(parents=True, exist_ok=True)
+        # Place the manifest itself
+        (product_dir / f"{manifest['product_id']}.xml").write_bytes(xml_bytes)
+        # Choose the linux-x86_64 archive
+        archive = next((a for a in manifest["archives"] if a["platform"] == "linux-x86_64"), None)
+        generic  = next((a for a in manifest["archives"] if not a["platform"]), None)
+        # Pick whichever exists; some products only ship generic
+        archives = [a for a in (generic, archive) if a]
+        if not archives:
+            die(f"no linux-x86_64 or generic archive in {url}")
+        for arch in archives:
+            href = arch["href"]
+            zip_url = urllib_join(url, href)
+            zip_path = product_dir / Path(href).name
+            if zip_path.exists() and arch["sha256"]:
+                got = sha256_b64_file(zip_path)
+                if got == arch["sha256"]:
+                    ok(f"{zip_path.name}: cached, sha256 matches")
+                    continue
+            download(zip_url, zip_path)
+            if arch["sha256"]:
+                got = sha256_b64_file(zip_path)
+                if got != arch["sha256"]:
+                    die(f"sha256 mismatch for {zip_path.name}\n   expected {arch['sha256']}\n   got      {got}")
+                ok(f"{zip_path.name}: sha256 verified")
+            # Extract zip into product_dir (the launcher expects unpacked content here)
+            info(f"extract {zip_path.name}")
+            extract_zip(zip_path, product_dir)
+        versions[manifest["product_id"]] = manifest["version"]
+        ok(f"laid down {product_dir}")
+
+    state_set("dsigner",
+              dsigner_version=versions.get("sk.ditec.ep.products.dsigner.java"),
+              djre_version=versions.get("sk.ditec.djre21"))
+
+
+def uninstall_dsigner() -> None:
+    if not DLAUNCHER_PRODUCTS.exists():
+        state_drop("dsigner")
+        return
+    for sub in ("sk.ditec.ep.products.dsigner.java", "sk.ditec.djre21"):
+        target = DLAUNCHER_PRODUCTS / sub
+        if target.exists():
+            shutil.rmtree(target)
+            ok(f"removed {target}")
+    state_drop("dsigner")
+
+
+def status_dsigner() -> dict:
+    dsigner_dir = DLAUNCHER_PRODUCTS / "sk.ditec.ep.products.dsigner.java"
+    djre_dir = DLAUNCHER_PRODUCTS / "sk.ditec.djre21"
+    out = {"installed": False, "dsigner": None, "djre": None}
+    if dsigner_dir.is_dir():
+        versions = sorted(p.name for p in dsigner_dir.iterdir() if p.is_dir())
+        if versions:
+            out["dsigner"] = versions[-1]
+    if djre_dir.is_dir():
+        versions = sorted(p.name for p in djre_dir.iterdir() if p.is_dir())
+        if versions:
+            out["djre"] = versions[-1]
+    out["installed"] = bool(out["dsigner"] and out["djre"])
+    return out
+
+
+def urllib_join(base: str, ref: str) -> str:
+    from urllib.parse import urljoin
+    return urljoin(base, ref)
+
+
+# === Component: Disig WebSigner ===========================================
+#
+# WebSigner is installed system-wide by its own .deb (/opt/disig/websigner/,
+# root-owned). Its launchers exec the x86_64 binaries directly, which abort
+# with "<jemalloc>: Unsupported system page size" on this 16K-page host. This
+# component re-points them through the persistent muvm microVM — same trick as
+# dBridge2Nm / eID_Client. `update websigner` (and `install` on a box without it)
+# downloads Disig's amd64 .deb and extracts its payload over /opt/disig/websigner
+# via sudo; `reinstall websigner` does only the re-point (no download/sudo). The
+# re-point writes user-side wrapper scripts, fixes the tray autostart entry,
+# writes a user-level menu .desktop that shadows the root-owned one, and rewrites
+# the browser native-messaging manifests' "path" to the wrappers.
+
+WRAPPER_WEBSIGNER_TRAY_BODY = """\
+#!/bin/sh
+# Disig WebSigner tray, launched inside the persistent muvm microVM.
+# Generated by eid-stack. Edits will be overwritten on update/reinstall.
+
+exec %MUVM% -i -- env \\
+    LD_LIBRARY_PATH=%WS_ROOT%/lib \\
+    QT_QPA_PLATFORM=xcb \\
+    %WS_ROOT%/bin/WebSignerTray "$@"
+"""
+
+WRAPPER_WEBSIGNER_NM_BODY = """\
+#!/bin/sh
+# Disig WebSigner native-messaging host, launched inside the persistent muvm
+# microVM. Generated by eid-stack. Edits overwritten on update/reinstall.
+
+exec %MUVM% -i -- env \\
+    LD_LIBRARY_PATH=%WS_ROOT%/lib \\
+    QT_QPA_PLATFORM=xcb \\
+    %WS_ROOT%/bin/WebSigner "$@"
+"""
+
+
+def _websigner_autostart_bak() -> Path:
+    return WEBSIGNER_AUTOSTART.parent / (WEBSIGNER_AUTOSTART.name + ".eid-stack.bak")
+
+
+def detect_websigner_version() -> Optional[str]:
+    """Read <Version> out of /opt/disig/websigner/etc/WebSigner.conf."""
+    conf = WEBSIGNER_ROOT / "etc/WebSigner.conf"
+    if not conf.exists():
+        return None
+    try:
+        root = ET.fromstring(conf.read_text())
+    except Exception:
+        return None
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == "Version" and (el.text or "").strip():
+            return el.text.strip()
+    return None
+
+
+def latest_websigner_version() -> Optional[str]:
+    """Parse <version> out of Disig's version-linux.xml update manifest."""
+    try:
+        xml_bytes, _ = http_get(URL_WEBSIGNER_VERSION_XML)
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        warn(f"WebSigner version check failed: {e}")
+        return None
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == "version" and (el.text or "").strip():
+            return el.text.strip()
+    return None
+
+
+def update_websigner_deb(force: bool = False) -> bool:
+    """Download Disig's amd64 .deb and extract its payload over /opt/disig/websigner.
+
+    WebSigner's own updater is unusable on this box: it installs the .deb by
+    shelling out to gdebi, but (a) gdebi isn't installed, (b) the .deb is amd64
+    on an arm64 host so dpkg would reject it anyway, and (c) /opt/disig/websigner
+    isn't even dpkg-registered — it was laid down by manual extraction. Disig
+    publishes no arm64 build, so the amd64 binaries (run through muvm) are all we
+    get. We replicate a package install by hand: dpkg-deb -x into a staging dir,
+    then sudo-copy opt/disig/websigner/ over the live tree. Returns True if the
+    payload was (re)written, False if already current and not forced."""
+    need_cmd("dpkg-deb")
+    need_cmd("sudo")
+    installed = detect_websigner_version()
+    latest = latest_websigner_version()
+    if installed and latest and installed == latest and not force:
+        ok(f"WebSigner {installed} payload is current")
+        return False
+    info(f"WebSigner payload: {installed or 'not present'} → {latest or 'unknown'}")
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        deb = td / "disig-web-signer_amd64.deb"
+        download(URL_WEBSIGNER_DEB, deb)
+        stage = td / "stage"
+        stage.mkdir()
+        info(f"extract {deb.name}")
+        run(["dpkg-deb", "-x", str(deb), str(stage)])
+        payload = stage / "opt/disig/websigner"
+        if not payload.is_dir():
+            die(f"{deb.name} did not contain opt/disig/websigner/")
+        info(f"installing payload over {WEBSIGNER_ROOT} — you'll be prompted for sudo")
+        run(["sudo", "rm", "-rf", str(WEBSIGNER_ROOT)])
+        run(["sudo", "mkdir", "-p", str(WEBSIGNER_ROOT.parent)])
+        run(["sudo", "cp", "-a", str(payload), str(WEBSIGNER_ROOT)])
+        run(["sudo", "chown", "-R", "root:root", str(WEBSIGNER_ROOT)])
+    new_ver = detect_websigner_version()
+    ok(f"WebSigner payload updated → {new_ver or 'unknown'}")
+    return True
+
+
+def fix_websigner_autostart() -> None:
+    """Rewrite the user autostart entry so the tray launches through muvm.
+    The original (vendor) entry is backed up once. Note: WebSignerTray itself
+    re-creates this file from /opt/disig/.../share on its own runs, so this may
+    need re-applying after a WebSigner update (`eid-stack reinstall websigner`)."""
+    src = WEBSIGNER_ROOT / "share/applications/sk.disig.WebSigner.desktop"
+    WEBSIGNER_AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+    if WEBSIGNER_AUTOSTART.exists():
+        text = WEBSIGNER_AUTOSTART.read_text()
+        bak = _websigner_autostart_bak()
+        if not bak.exists() and str(WRAPPER_WEBSIGNER_TRAY) not in text:
+            bak.write_text(text)
+            ok(f"backed up original autostart → {bak}")
+    elif src.exists():
+        text = src.read_text()
+    else:
+        text = ("[Desktop Entry]\nType=Application\nName=Web Signer\n"
+                f"Icon={WEBSIGNER_ROOT}/share/icons/WebSigner.png\nTerminal=false\n")
+
+    lines, seen = [], set()
+    for line in text.splitlines():
+        if line.startswith(("Exec=", "TryExec=")):
+            key = line.split("=", 1)[0]
+            lines.append(f"{key}={WRAPPER_WEBSIGNER_TRAY}")
+            seen.add(key)
+        else:
+            lines.append(line)
+    for key in ("Exec", "TryExec"):
+        if key not in seen:
+            lines.append(f"{key}={WRAPPER_WEBSIGNER_TRAY}")
+    WEBSIGNER_AUTOSTART.write_text("\n".join(lines) + "\n")
+    WEBSIGNER_AUTOSTART.chmod(0o644)
+    ok(f"re-pointed autostart {WEBSIGNER_AUTOSTART} → {WRAPPER_WEBSIGNER_TRAY}")
+
+
+def fix_websigner_menu_entry() -> None:
+    """Write a user-level menu .desktop that shadows the root-owned
+    /usr/share/applications/sk.disig.WebSigner.desktop. The .deb (and WebSigner's
+    own updater) keep resetting that system file to exec the native x86_64
+    WebSignerTray.sh, which aborts with jemalloc's page-size error on this 16K
+    host. A user-level entry of the same name takes XDG precedence and — unlike
+    sudo-editing /usr/share — survives future .deb updates. Nothing to back up:
+    the system file underneath is left untouched. Also forces a Categories= line
+    so the entry doesn't land in the desktop menu's "Lost & Found"."""
+    src = WEBSIGNER_ROOT / "share/applications/sk.disig.WebSigner.desktop"
+    if src.exists():
+        text = src.read_text()
+    else:
+        text = ("[Desktop Entry]\nType=Application\nName=Web Signer\n"
+                f"Icon={WEBSIGNER_ROOT}/share/icons/WebSigner.png\nTerminal=false\n")
+
+    lines, seen, has_categories = [], set(), False
+    for line in text.splitlines():
+        if line.startswith(("Exec=", "TryExec=")):
+            key = line.split("=", 1)[0]
+            lines.append(f"{key}={WRAPPER_WEBSIGNER_TRAY}")
+            seen.add(key)
+        else:
+            if line.startswith("Categories="):
+                has_categories = True
+            lines.append(line)
+    for key in ("Exec", "TryExec"):
+        if key not in seen:
+            lines.append(f"{key}={WRAPPER_WEBSIGNER_TRAY}")
+    if not has_categories:
+        lines.append("Categories=Utility;Security;")
+
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    WEBSIGNER_MENU_ENTRY.write_text("\n".join(lines) + "\n")
+    WEBSIGNER_MENU_ENTRY.chmod(0o644)
+    ok(f"re-pointed menu entry {WEBSIGNER_MENU_ENTRY} → {WRAPPER_WEBSIGNER_TRAY}")
+
+
+def write_websigner_nm_manifests() -> list[Path]:
+    """Copy Disig's NM manifests into installed browsers, rewriting their
+    `path` to our muvm wrapper instead of the crashing /opt/disig WebSigner.sh."""
+    written: list[Path] = []
+
+    def place(srcs: list[Path], dirpath: Path) -> None:
+        for src in srcs:
+            try:
+                manifest = json.loads(src.read_text())
+            except Exception as e:
+                warn(f"skip {src.name}: {e}")
+                continue
+            manifest["path"] = str(WRAPPER_WEBSIGNER_NM)
+            dirpath.mkdir(parents=True, exist_ok=True)
+            target = dirpath / src.name
+            target.write_text(json.dumps(manifest, indent=2) + "\n")
+            target.chmod(0o644)
+            written.append(target)
+            ok(f"wrote NM manifest: {target}")
+
+    chrome_src = sorted((WEBSIGNER_ROOT / "chrome").glob("sk.disig.websigner.*.json"))
+    for name, dirpath in NM_BROWSERS.items():
+        # write into any browser whose config root exists, OR brave (recommended)
+        if dirpath.parent.parent.exists() or name == "brave":
+            place(chrome_src, dirpath)
+
+    firefox_src = sorted((WEBSIGNER_ROOT / "firefox").glob("sk.disig.websigner.*.json"))
+    if (HOME / ".mozilla").is_dir():
+        place(firefox_src, FIREFOX_NM_DIR)
+
+    return written
+
+
+def install_websigner() -> None:
+    if not WEBSIGNER_ROOT.is_dir():
+        info(f"{WEBSIGNER_ROOT} not present — fetching Disig's .deb")
+        update_websigner_deb(force=True)
+    if not WEBSIGNER_ROOT.is_dir():
+        die(f"Disig WebSigner still not found at {WEBSIGNER_ROOT} after download.")
+    need_cmd("muvm")
+    muvm = muvm_path()
+
+    for wrapper, body in ((WRAPPER_WEBSIGNER_TRAY, WRAPPER_WEBSIGNER_TRAY_BODY),
+                          (WRAPPER_WEBSIGNER_NM, WRAPPER_WEBSIGNER_NM_BODY)):
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(body
+                           .replace("%MUVM%", str(muvm))
+                           .replace("%WS_ROOT%", str(WEBSIGNER_ROOT)))
+        wrapper.chmod(0o755)
+        ok(f"wrote wrapper {wrapper}")
+
+    fix_websigner_autostart()
+    fix_websigner_menu_entry()
+    write_websigner_nm_manifests()
+
+    version = detect_websigner_version()
+    state_set("websigner", source=str(WEBSIGNER_ROOT), version=version)
+    ok(f"Disig WebSigner version: {version or 'unknown'}")
+
+
+def uninstall_websigner() -> None:
+    bak = _websigner_autostart_bak()
+    if bak.exists():
+        WEBSIGNER_AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+        WEBSIGNER_AUTOSTART.write_text(bak.read_text())
+        bak.unlink()
+        ok(f"restored original autostart {WEBSIGNER_AUTOSTART}")
+    else:
+        remove_path(WEBSIGNER_AUTOSTART)
+    remove_path(WEBSIGNER_MENU_ENTRY)
+    remove_path(WRAPPER_WEBSIGNER_TRAY)
+    remove_path(WRAPPER_WEBSIGNER_NM)
+    for dirpath in list(NM_BROWSERS.values()) + [FIREFOX_NM_DIR]:
+        if dirpath.is_dir():
+            for p in dirpath.glob("sk.disig.websigner.*.json"):
+                p.unlink(missing_ok=True)
+                ok(f"removed {p}")
+    state_drop("websigner")
+
+
+def status_websigner() -> dict:
+    autostart_fixed = (WEBSIGNER_AUTOSTART.exists()
+                       and str(WRAPPER_WEBSIGNER_TRAY) in WEBSIGNER_AUTOSTART.read_text())
+    menu_entry_fixed = (WEBSIGNER_MENU_ENTRY.exists()
+                        and str(WRAPPER_WEBSIGNER_TRAY) in WEBSIGNER_MENU_ENTRY.read_text())
+    return {
+        "installed": WEBSIGNER_ROOT.is_dir() and WRAPPER_WEBSIGNER_TRAY.exists(),
+        "present": WEBSIGNER_ROOT.is_dir(),
+        "version": detect_websigner_version(),
+        "tray_wrapper": WRAPPER_WEBSIGNER_TRAY.exists(),
+        "nm_wrapper": WRAPPER_WEBSIGNER_NM.exists(),
+        "autostart_fixed": autostart_fixed,
+        "menu_entry_fixed": menu_entry_fixed,
+    }
+
+
+# === update / list ========================================================
+
+def is_changed(component: str, url: str) -> Optional[bool]:
+    s = state_load().get(component, {})
+    try:
+        h = http_head(url)
+    except Exception as e:
+        warn(f"HEAD {url}: {e}")
+        return None
+    et_new = h.get("ETag")
+    lm_new = h.get("Last-Modified")
+    et_old = s.get("etag")
+    lm_old = s.get("last_modified")
+    if et_new and et_old and et_new != et_old:
+        return True
+    if lm_new and lm_old and lm_new != lm_old:
+        return True
+    if et_new and et_old and et_new == et_old:
+        return False
+    if lm_new and lm_old and lm_new == lm_old:
+        return False
+    return None  # unknown
+
+
+def _tilde(p) -> str:
+    """Contract $HOME to ~ for list-display paths."""
+    s = str(p)
+    h = str(HOME)
+    return "~" + s[len(h):] if s == h or s.startswith(h + "/") else s
+
+
+# Per-component install root surfaced in `list`. Picked for "where do I look on
+# disk for this component" — for muvm-service that's the muvm binary itself
+# (the systemd unit and the ~/.local/bin/muvm-guest symlink are just glue).
+COMPONENT_PATH = {
+    "muvm-service": HOME / ".cargo/bin/muvm",
+    "dlauncher":    DLAUNCHER_ROOT,
+    "eid-klient":   EID_KLIENT_ROOT,
+    "dsigner":      DLAUNCHER_PRODUCTS,
+    "websigner":    WEBSIGNER_ROOT,
+}
+
+
+def cmd_list() -> None:
+    s = state_load()
+    rows = []
+    for comp in ALL_COMPONENTS:
+        if comp == "muvm-service":
+            st = status_muvm_service()
+            installed = "yes" if st["installed"] else "no"
+            extra = "active" if st["active"] else "inactive" if st["installed"] else "—"
+            if st["active"] and not st["shim_active"]:
+                extra += " (no ipv6 shim)"
+            update = "—"
+        elif comp == "dlauncher":
+            st = status_dlauncher()
+            installed = "yes" if st.get("installed") else "no"
+            extra = (st.get("version") or "unknown") if st.get("installed") else "—"
+            update = _fmt_update(is_changed("dlauncher", URL_DLAUNCHER)) if st.get("installed") else "—"
+        elif comp == "eid-klient":
+            st = status_eid_klient()
+            installed = "yes" if st.get("installed") else "no"
+            extra = (st.get("version") or "unknown") if st.get("installed") else "—"
+            update = _fmt_update(is_changed("eid-klient", URL_EID_KLIENT)) if st.get("installed") else "—"
+        elif comp == "dsigner":
+            st = status_dsigner()
+            installed = "yes" if st.get("installed") else "no"
+            extra = f"D.Signer {st.get('dsigner') or '—'} / JRE {st.get('djre') or '—'}" if st.get("installed") else "—"
+            # For dsigner, "update" check would need to re-parse the XML; do a HEAD on the XML
+            update = _fmt_update(is_changed("dsigner-xml", URL_DSIGNER_XML)) if st.get("installed") else "—"
+        elif comp == "websigner":
+            st = status_websigner()
+            installed = "yes" if st.get("installed") else "no"
+            if st.get("installed"):
+                ver = st.get("version") or "unknown"
+                extra = ver if st.get("autostart_fixed") else f"{ver} (autostart NOT fixed)"
+            elif st.get("present"):
+                extra = "present, not wired"
+            else:
+                extra = "—"
+            if st.get("installed") or st.get("present"):
+                inst_v, latest_v = detect_websigner_version(), latest_websigner_version()
+                if inst_v and latest_v:
+                    update = "current" if inst_v == latest_v else f"newer ({latest_v})"
+                else:
+                    update = "?"
+            else:
+                update = "—"
+        else:
+            continue
+        path = COMPONENT_PATH[comp]
+        path_str = _tilde(path) if path.exists() else f"{_tilde(path)} (missing)"
+        rows.append((comp, installed, extra, update, path_str))
+
+    headers = ("component", "installed", "version/state", "upstream", "path")
+    cols = list(zip(*rows))
+    widths = [max(len(h), *(len(str(x)) for x in col)) for h, col in zip(headers, cols)]
+    fmt = lambda cells: "  ".join(str(c).ljust(w) for c, w in zip(cells, widths)).rstrip()
+    # Underline spans the widest row, not the (rstripped) header — the header's
+    # last column ("path") is usually shorter than the longest path value.
+    total_width = sum(widths) + 2 * (len(widths) - 1)
+    print(fmt(headers))
+    print("-" * total_width)
+    for row in rows:
+        print(fmt(row))
+
+
+def _fmt_update(changed: Optional[bool]) -> str:
+    if changed is None:
+        return "?"
+    return "newer" if changed else "current"
+
+
+# === Dispatch =============================================================
+
+INSTALLERS = {
+    "muvm-service": install_muvm_service,
+    "dlauncher":    install_dlauncher,
+    "eid-klient":   install_eid_klient,
+    "dsigner":      install_dsigner,
+    "websigner":    install_websigner,
+}
+UNINSTALLERS = {
+    "muvm-service": uninstall_muvm_service,
+    "dlauncher":    uninstall_dlauncher,
+    "eid-klient":   uninstall_eid_klient,
+    "dsigner":      uninstall_dsigner,
+    "websigner":    uninstall_websigner,
+}
+STATUS = {
+    "muvm-service": status_muvm_service,
+    "dlauncher":    status_dlauncher,
+    "eid-klient":   status_eid_klient,
+    "dsigner":      status_dsigner,
+    "websigner":    status_websigner,
+}
+UPSTREAM_URL = {
+    "dlauncher":  URL_DLAUNCHER,
+    "eid-klient": URL_EID_KLIENT,
+    "dsigner":    URL_DSIGNER_XML,
+}
+
+
+def remove_path(p: Path) -> None:
+    if p.is_symlink() or p.exists():
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink(missing_ok=True)
+        ok(f"removed {p}")
+
+
+def cmd_install(comps: list[str]) -> None:
+    for c in [x for x in INSTALL_ORDER if x in comps]:
+        info(f"=== installing {c} ===")
+        INSTALLERS[c]()
+
+
+def cmd_uninstall(comps: list[str]) -> None:
+    for c in [x for x in UNINSTALL_ORDER if x in comps]:
+        info(f"=== uninstalling {c} ===")
+        UNINSTALLERS[c]()
+
+
+def cmd_reinstall(comps: list[str]) -> None:
+    cmd_uninstall(comps)
+    cmd_install(comps)
+
+
+def cmd_update(comps: list[str]) -> None:
+    state = state_load()
+    to_update = []
+    for c in comps:
+        if c not in state:
+            warn(f"{c} not installed; skipping (use 'install' instead)")
+            continue
+        if c == "muvm-service":
+            # No upstream URL tracked — just re-apply the generated unit/wrappers.
+            to_update.append(c)
+            continue
+        if c == "websigner":
+            # WebSigner's own updater can't run here (gdebi + amd64 .deb — see
+            # update_websigner_deb). Fetch + extract the .deb ourselves, then
+            # fall through to reinstall so the muvm re-point is re-applied.
+            update_websigner_deb()
+            to_update.append(c)
+            continue
+        url = UPSTREAM_URL[c]
+        changed = is_changed(c, url)
+        if changed is None:
+            warn(f"{c}: cannot determine if upstream changed; updating anyway")
+            to_update.append(c)
+        elif changed:
+            info(f"{c}: upstream changed; updating")
+            to_update.append(c)
+        else:
+            ok(f"{c}: up to date")
+    if to_update:
+        cmd_reinstall(to_update)
+
+
+def parse_components(args: list[str], *, default_to: list[str]) -> list[str]:
+    if not args or args == ["all"]:
+        return list(default_to)
+    bad = [a for a in args if a not in ALL_COMPONENTS]
+    if bad:
+        die(f"unknown component(s): {', '.join(bad)}. Known: {', '.join(ALL_COMPONENTS)}")
+    return args
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="eid-stack", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("command", choices=["install", "update", "reinstall", "uninstall", "list", "help"],
+                   help="action to perform")
+    p.add_argument("components", nargs="*", help="components (default: all)")
+    args = p.parse_args()
+
+    if args.command == "help":
+        p.print_help()
+        return
+    if args.command == "list":
+        cmd_list()
+        return
+
+    if args.command in ("install", "reinstall"):
+        comps = parse_components(args.components, default_to=ALL_COMPONENTS)
+        (cmd_reinstall if args.command == "reinstall" else cmd_install)(comps)
+    elif args.command == "uninstall":
+        # default uninstall scope: only what's currently installed
+        installed = [c for c in ALL_COMPONENTS if c in state_load()]
+        comps = parse_components(args.components, default_to=installed)
+        cmd_uninstall(comps)
+    elif args.command == "update":
+        installed = [c for c in ALL_COMPONENTS if c in state_load()]
+        comps = parse_components(args.components, default_to=installed)
+        cmd_update(comps)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("interrupted")
+    except subprocess.CalledProcessError as e:
+        die(f"command failed: {e}")
