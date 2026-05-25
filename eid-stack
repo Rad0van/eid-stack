@@ -834,6 +834,36 @@ def extract_zip(zip_path: Path, dest: Path) -> None:
                 out.chmod(mode & ~umask)
 
 
+def install_xint_wrapper(jre_bin: Path) -> None:
+    """Replace <jre>/bin/java with a wrapper forcing -Xint (interpreter only).
+
+    Under muvm/FEX the JVM's C1/C2 JIT emits x86 code FEX mistranslates, so
+    D.Signer SIGSEGVs in compiled BigInteger/String methods after a few
+    signatures (the JIT only kicks in once methods get hot). The template
+    interpreter is stable, so -Xint avoids the crash. Idempotent and
+    re-extract-safe: detects whether bin/java is already the wrapper or a
+    freshly-extracted ELF."""
+    java = jre_bin / "java"
+    real = jre_bin / "java.bin"
+    if java.is_file():
+        with open(java, "rb") as fh:
+            is_wrapper = fh.read(2) == b"#!"
+        if not is_wrapper:          # fresh ELF -> stash as java.bin (overwrite any old)
+            java.replace(real)
+    if not real.exists():
+        warn(f"{java} not found; skipping -Xint wrapper")
+        return
+    real.chmod(0o755)
+    java.write_text(
+        "#!/bin/sh\n"
+        "# eid-stack: interpreter-only (-Xint). The JVM JIT emits x86 code that\n"
+        "# muvm/FEX mistranslates -> D.Signer SIGSEGV after a few signatures.\n"
+        f'exec "{real}" -Xint "$@"\n'
+    )
+    java.chmod(0o755)
+    ok(f"wrapped {java} with -Xint (FEX JIT workaround)")
+
+
 def install_dsigner() -> None:
     """Pre-fetch D.Signer Java + Zulu JRE 21 into ~/.ditec/dlauncher2/products/.
     Best-effort: D.Launcher may still re-verify on first sign, but the files
@@ -878,6 +908,11 @@ def install_dsigner() -> None:
             extract_zip(zip_path, product_dir)
         versions[manifest["product_id"]] = manifest["version"]
         ok(f"laid down {product_dir}")
+
+    # Force the bundled JRE into interpreter-only mode (FEX JIT SIGSEGV workaround).
+    djre_ver = versions.get("sk.ditec.djre21")
+    if djre_ver:
+        install_xint_wrapper(DLAUNCHER_PRODUCTS / "sk.ditec.djre21" / djre_ver / "bin")
 
     state_set("dsigner",
               dsigner_version=versions.get("sk.ditec.ep.products.dsigner.java"),
